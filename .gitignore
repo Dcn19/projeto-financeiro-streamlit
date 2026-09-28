@@ -1,0 +1,23 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# Chaves e variáveis locais
+.env
+
+# Secrets reais do Streamlit
+.streamlit/secrets.toml
+
+# Arquivo privado de entrega com credenciais
+README_ENTREGA.txt
+
+# Python
+__pycache__/
+*.py[cod]
+
+# VS Code
+.vscode/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
