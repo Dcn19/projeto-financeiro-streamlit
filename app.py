@@ -1,8 +1,10 @@
 import base64
+import hashlib
 import hmac
 import html
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Literal, Optional
@@ -49,12 +51,12 @@ def obter_configuracao(nome: str, padrao: Optional[str] = None) -> Optional[str]
 GEMINI_API_KEY_PROJETO = obter_configuracao("GEMINI_API_KEY")
 GEMINI_MODEL_PADRAO = obter_configuracao(
     "GEMINI_MODEL",
-    "gemini-3.8-flash",
+    "gemini-3.6-flash",
 )
 
 APP_USERNAME = obter_configuracao("APP_USERNAME")
 APP_PASSWORD = obter_configuracao("APP_PASSWORD")
-APP_VERSION = obter_configuracao("APP_VERSION", "1.0.0")
+APP_VERSION = obter_configuracao("APP_VERSION", "1.1.0")
 GIT_COMMIT_CONFIGURADO = obter_configuracao("GIT_COMMIT")
 
 
@@ -251,12 +253,30 @@ def exigir_autenticacao() -> None:
         st.stop()
 
 
+def limpar_estado_gemini() -> None:
+    chaves = [
+        "gemini_model",
+        "gemini_model_manual",
+        "gemini_modo_manual",
+        "gemini_modelos",
+        "gemini_modelos_fingerprint",
+        "gemini_origem_modelos",
+        "gemini_feedback_modelos",
+        "gemini_status_teste",
+        "gemini_tentativa_projeto_realizada",
+        "gemini_carregamento_pendente",
+    ]
+
+    for chave in chaves:
+        st.session_state.pop(chave, None)
+
+
 def encerrar_sessao() -> None:
+    limpar_estado_gemini()
+
     chaves_sessao = [
         "autenticado",
         "usuario_logado",
-        "gemini_model",
-        "gemini_model_input",
         "gemini_api_key_temporaria",
         "gemini_api_key_input",
     ]
@@ -265,12 +285,6 @@ def encerrar_sessao() -> None:
         st.session_state.pop(chave, None)
 
     st.rerun()
-
-
-def voltar_para_chave_projeto() -> None:
-    """Remove a chave temporária e restaura o uso da chave configurada no projeto."""
-    st.session_state.pop("gemini_api_key_temporaria", None)
-    st.session_state["gemini_api_key_input"] = ""
 
 
 # ============================================================
@@ -541,7 +555,356 @@ REGRAS OBRIGATÓRIAS:
 
 
 # ============================================================
-# FUNÇÕES AUXILIARES
+# GEMINI: CHAVE, MODELOS E DISPONIBILIDADE
+# ============================================================
+
+
+def obter_chave_gemini_ativa() -> Optional[str]:
+    """Retorna a chave temporária da sessão ou, na ausência dela, a chave do projeto."""
+    chave_temporaria = st.session_state.get("gemini_api_key_temporaria")
+
+    if chave_temporaria and str(chave_temporaria).strip():
+        return str(chave_temporaria).strip()
+
+    return GEMINI_API_KEY_PROJETO
+
+
+def usando_chave_temporaria() -> bool:
+    chave_temporaria = st.session_state.get("gemini_api_key_temporaria")
+    return bool(chave_temporaria and str(chave_temporaria).strip())
+
+
+def fingerprint_chave(api_key: str) -> str:
+    """Gera uma impressão digital curta sem expor a API Key."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
+def normalizar_id_modelo(nome: Optional[str]) -> str:
+    if not nome:
+        return ""
+
+    nome_normalizado = str(nome).strip()
+
+    if nome_normalizado.startswith("models/"):
+        nome_normalizado = nome_normalizado.split("/", 1)[1]
+
+    return nome_normalizado
+
+
+def modelo_candidato_para_documentos(
+    modelo_id: str,
+    acoes_suportadas: set[str],
+) -> bool:
+    """
+    Filtra modelos Gemini gerais que suportam geração de conteúdo.
+
+    models.list() não informa diretamente se um modelo aceita PDF pela
+    Interactions API. Por isso, removemos famílias claramente voltadas a
+    imagem, áudio, TTS, live, embedding e outras modalidades específicas.
+    O teste opcional do modelo confirma se o ID selecionado responde pela
+    Interactions API antes de o usuário enviar um PDF.
+    """
+    if "generateContent" not in acoes_suportadas:
+        return False
+
+    if not modelo_id.startswith("gemini-"):
+        return False
+
+    termos_excluidos = (
+        "image",
+        "imagen",
+        "tts",
+        "live",
+        "audio",
+        "embedding",
+        "embed",
+        "robotics",
+        "computer-use",
+        "computer_use",
+        "veo",
+        "lyria",
+    )
+
+    return not any(termo in modelo_id.lower() for termo in termos_excluidos)
+
+
+def prioridade_modelo(modelo_id: str) -> tuple[int, str]:
+    preferidos = [
+        GEMINI_MODEL_PADRAO or "",
+        "gemini-3.6-flash",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ]
+
+    try:
+        indice = preferidos.index(modelo_id)
+    except ValueError:
+        indice = len(preferidos)
+
+    return indice, modelo_id
+
+
+def listar_modelos_gemini(api_key: str) -> list[dict]:
+    """Lista modelos disponíveis para a chave e filtra os candidatos ao projeto."""
+    if not api_key or not api_key.strip():
+        raise ValueError("Informe uma API Key do Gemini válida.")
+
+    client = genai.Client(api_key=api_key.strip())
+    modelos_encontrados: dict[str, dict] = {}
+
+    for modelo in client.models.list():
+        modelo_id = normalizar_id_modelo(getattr(modelo, "name", None))
+        acoes = set(getattr(modelo, "supported_actions", None) or [])
+
+        if not modelo_candidato_para_documentos(modelo_id, acoes):
+            continue
+
+        modelos_encontrados[modelo_id] = {
+            "id": modelo_id,
+            "nome": getattr(modelo, "display_name", None) or modelo_id,
+            "descricao": getattr(modelo, "description", None) or "",
+            "input_token_limit": getattr(modelo, "input_token_limit", None),
+            "output_token_limit": getattr(modelo, "output_token_limit", None),
+            "acoes": sorted(acoes),
+        }
+
+    modelos = sorted(
+        modelos_encontrados.values(),
+        key=lambda item: prioridade_modelo(item["id"]),
+    )
+
+    if not modelos:
+        raise RuntimeError(
+            "A chave foi consultada, mas nenhum modelo Gemini compatível com "
+            "geração de conteúdo foi encontrado para esta aplicação."
+        )
+
+    return modelos
+
+
+def escolher_modelo_inicial(modelos: list[dict]) -> str:
+    ids = [modelo["id"] for modelo in modelos]
+    modelo_atual = st.session_state.get("gemini_model")
+
+    candidatos = [
+        modelo_atual,
+        GEMINI_MODEL_PADRAO,
+        "gemini-3.6-flash",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ]
+
+    for candidato in candidatos:
+        if candidato and candidato in ids:
+            return candidato
+
+    return ids[0]
+
+
+def salvar_modelos_na_sessao(
+    modelos: list[dict],
+    api_key: str,
+    origem: str,
+) -> None:
+    st.session_state["gemini_modelos"] = modelos
+    st.session_state["gemini_modelos_fingerprint"] = fingerprint_chave(api_key)
+    st.session_state["gemini_origem_modelos"] = origem
+    st.session_state["gemini_model"] = escolher_modelo_inicial(modelos)
+    st.session_state.pop("gemini_status_teste", None)
+    st.session_state["gemini_modo_manual"] = False
+    st.session_state["gemini_model_manual"] = st.session_state["gemini_model"]
+
+
+def solicitar_validacao_chave_temporaria() -> None:
+    """Marca a nova chave para validação após Enter ou perda de foco do campo."""
+    chave = str(st.session_state.get("gemini_api_key_input", "")).strip()
+
+    if chave:
+        st.session_state["gemini_carregamento_pendente"] = "temporaria"
+        st.session_state.pop("gemini_feedback_modelos", None)
+        st.session_state.pop("gemini_status_teste", None)
+
+
+def voltar_para_chave_projeto() -> None:
+    """Remove a chave temporária e agenda o carregamento da chave do projeto."""
+    st.session_state.pop("gemini_api_key_temporaria", None)
+    st.session_state["gemini_api_key_input"] = ""
+    st.session_state.pop("gemini_modelos", None)
+    st.session_state.pop("gemini_modelos_fingerprint", None)
+    st.session_state.pop("gemini_origem_modelos", None)
+    st.session_state.pop("gemini_status_teste", None)
+    st.session_state.pop("gemini_feedback_modelos", None)
+    st.session_state["gemini_modo_manual"] = False
+    st.session_state["gemini_tentativa_projeto_realizada"] = False
+
+    if GEMINI_API_KEY_PROJETO:
+        st.session_state["gemini_carregamento_pendente"] = "projeto"
+
+
+def solicitar_recarregamento_modelos() -> None:
+    """Agenda uma nova consulta de modelos para a chave atualmente ativa."""
+    if usando_chave_temporaria():
+        st.session_state["gemini_carregamento_pendente"] = "temporaria"
+    elif GEMINI_API_KEY_PROJETO:
+        st.session_state["gemini_carregamento_pendente"] = "projeto"
+
+    st.session_state.pop("gemini_feedback_modelos", None)
+    st.session_state.pop("gemini_status_teste", None)
+
+
+def obter_codigo_erro_gemini(erro: Exception) -> Optional[int]:
+    for atributo in ("code", "status_code"):
+        valor = getattr(erro, atributo, None)
+
+        try:
+            if valor is not None:
+                codigo = int(valor)
+                if 100 <= codigo <= 599:
+                    return codigo
+        except (TypeError, ValueError):
+            pass
+
+    texto = str(erro)
+    correspondencia = re.search(
+        r"\b(400|401|403|404|408|409|429|500|502|503|504)\b",
+        texto,
+    )
+
+    if correspondencia:
+        return int(correspondencia.group(1))
+
+    return None
+
+
+def mensagem_amigavel_erro_gemini(
+    erro: Exception,
+    contexto: str = "uso",
+) -> tuple[str, str]:
+    codigo = obter_codigo_erro_gemini(erro)
+    texto = str(erro).lower()
+
+    if "api_key_invalid" in texto or "api key not valid" in texto:
+        return (
+            "API Key inválida",
+            "A chave informada não foi aceita pelo Gemini. Confira a chave e tente novamente.",
+        )
+
+    if codigo in (400, 401) and "key" in texto:
+        return (
+            "Não foi possível validar a API Key",
+            "Confira se a chave foi copiada corretamente e se pertence a um projeto com acesso à Gemini API.",
+        )
+
+    if codigo == 403:
+        return (
+            "Projeto sem permissão para usar o Gemini",
+            "A API Key foi reconhecida, mas o projeto associado teve o acesso negado. "
+            "Use outra chave/projeto ou verifique as permissões no Google AI Studio.",
+        )
+
+    if codigo == 404:
+        return (
+            "Modelo indisponível",
+            "O modelo selecionado não foi encontrado ou não está disponível para esta chave/API.",
+        )
+
+    if codigo == 429:
+        return (
+            "Limite de uso atingido",
+            "A cota ou o limite de requisições do modelo foi atingido. "
+            "Aguarde a renovação da cota, escolha outro modelo ou use outra API Key.",
+        )
+
+    if codigo == 503:
+        return (
+            "Modelo temporariamente sobrecarregado",
+            "O Gemini informou alta demanda. Aguarde alguns minutos ou escolha outro modelo para evitar novas tentativas desnecessárias.",
+        )
+
+    if codigo in (500, 502, 504):
+        return (
+            "Serviço do Gemini temporariamente indisponível",
+            "O serviço apresentou uma falha temporária. Tente novamente mais tarde ou selecione outro modelo.",
+        )
+
+    if contexto == "listagem":
+        return (
+            "Não foi possível carregar os modelos",
+            "A consulta de modelos falhou. Confira a API Key e tente novamente.",
+        )
+
+    if contexto == "teste":
+        return (
+            "Não foi possível testar o modelo",
+            "O modelo não respondeu ao teste nesta sessão.",
+        )
+
+    return (
+        "Não foi possível processar a nota fiscal",
+        "O Gemini retornou um erro inesperado. Consulte os detalhes técnicos abaixo.",
+    )
+
+
+def carregar_modelos_para_chave(
+    api_key: str,
+    origem: str,
+) -> bool:
+    try:
+        modelos = listar_modelos_gemini(api_key)
+        salvar_modelos_na_sessao(modelos, api_key, origem)
+
+        if origem == "temporaria":
+            st.session_state["gemini_api_key_temporaria"] = api_key.strip()
+
+        st.session_state["gemini_feedback_modelos"] = {
+            "tipo": "success",
+            "mensagem": (
+                f"Chave validada. {len(modelos)} modelo(s) compatível(is) "
+                "com geração de conteúdo foram carregados."
+            ),
+        }
+        return True
+
+    except Exception as erro:
+        titulo, mensagem = mensagem_amigavel_erro_gemini(
+            erro,
+            contexto="listagem",
+        )
+        st.session_state["gemini_feedback_modelos"] = {
+            "tipo": "error",
+            "mensagem": f"{titulo}. {mensagem}",
+            "detalhes": str(erro),
+        }
+        return False
+
+
+def testar_modelo_gemini(
+    modelo_gemini: str,
+    api_key_gemini: str,
+) -> None:
+    """Faz uma chamada mínima e opcional pela Interactions API."""
+    client = genai.Client(api_key=api_key_gemini.strip())
+
+    interaction = client.interactions.create(
+        model=modelo_gemini.strip(),
+        input="Responda somente com a palavra OK.",
+        store=False,
+    )
+
+    if interaction.output_text is None:
+        raise RuntimeError("O modelo respondeu sem conteúdo de texto.")
+
+
+# ============================================================
+# FUNÇÕES AUXILIARES DA EXTRAÇÃO
 # ============================================================
 
 
@@ -579,6 +942,7 @@ def extrair_nota_fiscal(
 
     pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
+    # A lógica de leitura do PDF foi mantida pela Interactions API.
     interaction = client.interactions.create(
         model=modelo_gemini.strip(),
         input=[
@@ -606,21 +970,6 @@ def extrair_nota_fiscal(
     return NotaFiscalExtraida.model_validate_json(
         interaction.output_text
     )
-
-
-def obter_chave_gemini_ativa() -> Optional[str]:
-    """Retorna a chave temporária da sessão ou, na ausência dela, a chave do projeto."""
-    chave_temporaria = st.session_state.get("gemini_api_key_temporaria")
-
-    if chave_temporaria and str(chave_temporaria).strip():
-        return str(chave_temporaria).strip()
-
-    return GEMINI_API_KEY_PROJETO
-
-
-def usando_chave_temporaria() -> bool:
-    chave_temporaria = st.session_state.get("gemini_api_key_temporaria")
-    return bool(chave_temporaria and str(chave_temporaria).strip())
 
 
 def formatar_moeda(valor: Optional[float]) -> str:
@@ -859,7 +1208,7 @@ def mostrar_identificacao_alunos(
 
     versao_segura = html.escape(APP_VERSION or "não definida")
     commit_seguro = html.escape(commit_git)
-    modelo_seguro = html.escape(modelo_gemini)
+    modelo_seguro = html.escape(modelo_gemini or "não selecionado")
 
     st.markdown(
         f'<div class="version-footer">'
@@ -879,11 +1228,20 @@ exigir_autenticacao()
 if "gemini_model" not in st.session_state:
     st.session_state["gemini_model"] = GEMINI_MODEL_PADRAO
 
-if "gemini_model_input" not in st.session_state:
-    st.session_state["gemini_model_input"] = st.session_state["gemini_model"]
-
 if "gemini_api_key_input" not in st.session_state:
     st.session_state["gemini_api_key_input"] = ""
+
+if "gemini_modelos" not in st.session_state:
+    st.session_state["gemini_modelos"] = []
+
+if "gemini_modo_manual" not in st.session_state:
+    st.session_state["gemini_modo_manual"] = False
+
+if "gemini_model_manual" not in st.session_state:
+    st.session_state["gemini_model_manual"] = st.session_state["gemini_model"]
+
+if "gemini_tentativa_projeto_realizada" not in st.session_state:
+    st.session_state["gemini_tentativa_projeto_realizada"] = False
 
 
 # ============================================================
@@ -906,8 +1264,9 @@ with st.sidebar:
 
     st.markdown("### Configuração do Gemini")
     st.caption(
-        "A chave e o ID do modelo podem ser trocados sem modificar o "
-        "código-fonte. As alterações valem somente para a sessão atual."
+        "Cole uma API Key para validar a chave e carregar automaticamente "
+        "os modelos disponíveis. Depois de colar, pressione Enter ou clique "
+        "fora do campo."
     )
 
     st.text_input(
@@ -916,52 +1275,270 @@ with st.sidebar:
         type="password",
         placeholder="Deixe vazio para usar a chave do projeto",
         help=(
-            "Se uma chave for informada, ela será usada somente nesta sessão. "
-            "Ela não é gravada no código, no GitHub, no .env ou em banco de dados."
+            "A chave informada é validada consultando os modelos disponíveis. "
+            "Se for aceita, ela fica somente na sessão atual e não é gravada "
+            "no código, GitHub, .env ou banco de dados."
         ),
+        on_change=solicitar_validacao_chave_temporaria,
     )
 
-    st.text_input(
-        "ID do modelo Gemini",
-        key="gemini_model_input",
-        help=(
-            "Exemplo: gemini-3.8-flash. "
-            "Use um modelo disponível para a chave que estiver em uso."
-        ),
+    origem_pendente = st.session_state.pop(
+        "gemini_carregamento_pendente",
+        None,
     )
 
-    if st.button(
-        "Aplicar configuração",
-        use_container_width=True,
+    if origem_pendente == "temporaria":
+        chave_pendente = str(
+            st.session_state.get("gemini_api_key_input", "")
+        ).strip()
+
+        if chave_pendente:
+            with st.spinner("Validando chave e carregando modelos..."):
+                carregar_modelos_para_chave(
+                    chave_pendente,
+                    origem="temporaria",
+                )
+
+    elif origem_pendente == "projeto" and GEMINI_API_KEY_PROJETO:
+        with st.spinner("Carregando modelos da chave do projeto..."):
+            carregar_modelos_para_chave(
+                GEMINI_API_KEY_PROJETO,
+                origem="projeto",
+            )
+            st.session_state["gemini_tentativa_projeto_realizada"] = True
+
+    if (
+        not st.session_state.get("gemini_modelos")
+        and GEMINI_API_KEY_PROJETO
+        and not st.session_state.get("gemini_tentativa_projeto_realizada", False)
+        and not usando_chave_temporaria()
     ):
-        modelo_informado = st.session_state["gemini_model_input"].strip()
-        chave_informada = st.session_state["gemini_api_key_input"].strip()
+        with st.spinner("Carregando modelos da chave do projeto..."):
+            carregar_modelos_para_chave(
+                GEMINI_API_KEY_PROJETO,
+                origem="projeto",
+            )
+            st.session_state["gemini_tentativa_projeto_realizada"] = True
 
-        if not modelo_informado:
-            st.error("Informe um ID de modelo válido.")
+    feedback_modelos = st.session_state.get("gemini_feedback_modelos")
+
+    if feedback_modelos:
+        tipo = feedback_modelos.get("tipo")
+        mensagem = feedback_modelos.get("mensagem", "")
+
+        if tipo == "success":
+            st.success(mensagem)
+        elif tipo == "warning":
+            st.warning(mensagem)
         else:
-            st.session_state["gemini_model"] = modelo_informado
+            st.error(mensagem)
 
-            if chave_informada:
-                st.session_state["gemini_api_key_temporaria"] = chave_informada
+        detalhes = feedback_modelos.get("detalhes")
+        if detalhes:
+            with st.expander("Detalhes técnicos"):
+                st.code(detalhes)
 
-            st.success("Configuração aplicada para esta sessão.")
+    modelos_disponiveis = st.session_state.get("gemini_modelos", [])
+    ids_modelos = [modelo["id"] for modelo in modelos_disponiveis]
+
+    if modelos_disponiveis:
+        st.caption(
+            "Os modelos abaixo foram retornados pela API para a chave em uso "
+            "e filtrados para modelos Gemini gerais com suporte a geração de conteúdo."
+        )
+
+        st.toggle(
+            "Informar ID manualmente (avançado)",
+            key="gemini_modo_manual",
+            help=(
+                "Use somente se precisar testar um ID que não apareceu na lista. "
+                "A opção só é liberada depois que a chave e os modelos forem carregados."
+            ),
+        )
+
+        if st.session_state["gemini_modo_manual"]:
+            st.text_input(
+                "ID manual do modelo Gemini",
+                key="gemini_model_manual",
+                placeholder="Ex.: gemini-3.6-flash",
+            )
+
+            if st.button(
+                "Aplicar ID manual",
+                use_container_width=True,
+            ):
+                modelo_manual = str(
+                    st.session_state.get("gemini_model_manual", "")
+                ).strip()
+
+                if not modelo_manual:
+                    st.error("Informe um ID de modelo válido.")
+                else:
+                    st.session_state["gemini_model"] = modelo_manual
+                    st.session_state.pop("gemini_status_teste", None)
+                    st.success("ID manual aplicado para esta sessão.")
+
+        else:
+            modelo_atual = st.session_state.get("gemini_model")
+
+            if modelo_atual not in ids_modelos:
+                modelo_atual = escolher_modelo_inicial(modelos_disponiveis)
+                st.session_state["gemini_model"] = modelo_atual
+
+            indice_atual = ids_modelos.index(modelo_atual)
+
+            def rotulo_modelo(modelo_id: str) -> str:
+                detalhe = next(
+                    (
+                        item
+                        for item in modelos_disponiveis
+                        if item["id"] == modelo_id
+                    ),
+                    None,
+                )
+
+                if not detalhe:
+                    return modelo_id
+
+                nome = str(detalhe.get("nome") or "").strip()
+
+                if nome and nome.lower() != modelo_id.lower():
+                    return f"{nome} · {modelo_id}"
+
+                return modelo_id
+
+            modelo_selecionado = st.selectbox(
+                "Modelo Gemini",
+                options=ids_modelos,
+                index=indice_atual,
+                format_func=rotulo_modelo,
+                help=(
+                    "A lista é obtida pela API usando a chave ativa. "
+                    "A leitura do PDF continua sendo feita pela Interactions API."
+                ),
+            )
+
+            if modelo_selecionado != st.session_state.get("gemini_model"):
+                st.session_state["gemini_model"] = modelo_selecionado
+                st.session_state["gemini_model_manual"] = modelo_selecionado
+                st.session_state.pop("gemini_status_teste", None)
+
+            detalhe_selecionado = next(
+                (
+                    item
+                    for item in modelos_disponiveis
+                    if item["id"] == st.session_state["gemini_model"]
+                ),
+                None,
+            )
+
+            if detalhe_selecionado:
+                metadados = []
+                limite_entrada = detalhe_selecionado.get("input_token_limit")
+                limite_saida = detalhe_selecionado.get("output_token_limit")
+
+                if limite_entrada:
+                    metadados.append(f"entrada: {limite_entrada:,} tokens")
+
+                if limite_saida:
+                    metadados.append(f"saída: {limite_saida:,} tokens")
+
+                if metadados:
+                    st.caption(" · ".join(metadados))
+
+        chave_ativa = obter_chave_gemini_ativa()
+
+        if st.button(
+            "Testar modelo selecionado",
+            use_container_width=True,
+            disabled=not bool(chave_ativa),
+            help="O teste faz uma chamada curta e pode consumir uma requisição da cota.",
+        ):
+            if not chave_ativa:
+                st.session_state["gemini_status_teste"] = {
+                    "tipo": "error",
+                    "mensagem": "Nenhuma API Key está ativa.",
+                }
+            else:
+                with st.spinner("Testando o modelo pela Interactions API..."):
+                    try:
+                        testar_modelo_gemini(
+                            st.session_state["gemini_model"],
+                            chave_ativa,
+                        )
+                        st.session_state["gemini_status_teste"] = {
+                            "tipo": "success",
+                            "mensagem": (
+                                f"{st.session_state['gemini_model']} respondeu normalmente."
+                            ),
+                        }
+                    except Exception as erro:
+                        titulo, mensagem = mensagem_amigavel_erro_gemini(
+                            erro,
+                            contexto="teste",
+                        )
+                        st.session_state["gemini_status_teste"] = {
+                            "tipo": "error",
+                            "mensagem": f"{titulo}. {mensagem}",
+                            "detalhes": str(erro),
+                        }
+
+        status_teste = st.session_state.get("gemini_status_teste")
+
+        if status_teste:
+            if status_teste.get("tipo") == "success":
+                st.success(status_teste.get("mensagem", "Modelo disponível."))
+            else:
+                st.warning(status_teste.get("mensagem", "Falha no teste do modelo."))
+
+            if status_teste.get("detalhes"):
+                with st.expander("Detalhes técnicos do teste"):
+                    st.code(status_teste["detalhes"])
+
+    else:
+        st.selectbox(
+            "Modelo Gemini",
+            options=["Carregue uma API Key primeiro"],
+            disabled=True,
+        )
+        st.caption(
+            "O seletor de modelos só é liberado depois que uma chave válida "
+            "for consultada e os modelos forem carregados."
+        )
+
+    col_recarregar, col_restaurar = st.columns(2)
+
+    with col_recarregar:
+        st.button(
+            "Recarregar modelos",
+            use_container_width=True,
+            disabled=not bool(obter_chave_gemini_ativa()),
+            on_click=solicitar_recarregamento_modelos,
+        )
+
+    with col_restaurar:
+        st.button(
+            "Chave do projeto",
+            use_container_width=True,
+            disabled=not usando_chave_temporaria(),
+            on_click=voltar_para_chave_projeto,
+            help="Remove a chave temporária e volta para a chave configurada no projeto.",
+        )
 
     if usando_chave_temporaria():
-        st.caption("Chave em uso: `chave temporária informada pelo usuário`")
-
-        st.button(
-            "Voltar para a chave do projeto",
-            use_container_width=True,
-            on_click=voltar_para_chave_projeto,
-        )
+        st.caption("Chave em uso: `chave temporária validada`")
     elif GEMINI_API_KEY_PROJETO:
         st.caption("Chave em uso: `chave do projeto`")
     else:
         st.caption("Chave em uso: `nenhuma chave configurada`")
 
+    if st.session_state.get("gemini_modelos"):
+        st.caption(
+            f"Modelos carregados: `{len(st.session_state['gemini_modelos'])}`"
+        )
+
     st.caption(
-        f"Modelo em uso: `{st.session_state['gemini_model']}`"
+        f"Modelo em uso: `{st.session_state.get('gemini_model', 'não selecionado')}`"
     )
 
     st.divider()
@@ -994,6 +1571,18 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+configuracao_gemini_pronta = bool(
+    obter_chave_gemini_ativa()
+    and st.session_state.get("gemini_model")
+    and st.session_state.get("gemini_modelos")
+)
+
+if not configuracao_gemini_pronta:
+    st.info(
+        "A configuração do Gemini ainda não está pronta. Abra a barra lateral, "
+        "valide uma API Key e aguarde o carregamento dos modelos."
+    )
 
 with st.container(border=True):
     st.markdown(
@@ -1029,14 +1618,14 @@ with st.container(border=True):
         "EXTRAIR DADOS",
         type="primary",
         use_container_width=True,
-        disabled=arquivo is None,
+        disabled=(arquivo is None or not configuracao_gemini_pronta),
     )
 
 st.markdown(
     '<div class="small-note" style="text-align:center; margin-top:0.55rem;">'
     "O PDF é processado pelo Gemini para extração e interpretação "
     "dos dados financeiros. "
-    f"Modelo atual: <strong>{st.session_state['gemini_model']}</strong>."
+    f"Modelo atual: <strong>{html.escape(st.session_state.get('gemini_model') or 'não selecionado')}</strong>."
     "</div>",
     unsafe_allow_html=True,
 )
@@ -1069,10 +1658,11 @@ if botao_extrair and arquivo is not None:
         )
 
     except Exception as erro:
-        st.error(
-            "Não foi possível processar "
-            "a nota fiscal."
+        titulo, mensagem = mensagem_amigavel_erro_gemini(
+            erro,
+            contexto="extracao",
         )
+        st.error(f"{titulo}. {mensagem}")
 
         with st.expander(
             "Detalhes técnicos do erro"
@@ -1087,5 +1677,5 @@ if botao_extrair and arquivo is not None:
 # ============================================================
 
 mostrar_identificacao_alunos(
-    st.session_state["gemini_model"]
+    st.session_state.get("gemini_model", "não selecionado")
 )

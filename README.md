@@ -4,43 +4,98 @@ Aplicação Web desenvolvida em **Python + Streamlit** para processar uma nota
 fiscal em PDF com o **Gemini** e devolver os dados extraídos em formato
 estruturado e JSON.
 
-## Recursos da versão atual
+## Recursos da versão 1.1.0
 
 - Login único, sem banco de dados.
 - Usuário e senha armazenados fora do código-fonte.
 - Chave padrão do Gemini armazenada fora do código-fonte.
 - Possibilidade de informar uma API Key temporária pela barra lateral.
-- ID do modelo Gemini configurável pela barra lateral durante a sessão.
-- A chave temporária e o ID do modelo podem ser trocados sem alterar o código entregue.
-- Identificação da versão da aplicação.
-- Exibição do commit Git usado pela aplicação, quando o ambiente disponibiliza o repositório.
+- Validação da API Key por meio da consulta de modelos disponíveis.
+- Carregamento automático dos modelos depois que a chave é validada.
+- Seletor de modelo liberado somente depois do carregamento dos modelos.
+- Filtro para modelos Gemini gerais que suportam `generateContent`.
+- Opção avançada para informar um ID manual depois da validação da chave.
+- Teste opcional do modelo selecionado usando a Interactions API.
+- Tratamento amigável para erros comuns como 403, 404, 429 e 503.
+- Leitura do PDF mantida pela **Interactions API**, com saída estruturada em JSON.
+- Identificação da versão da aplicação e do commit Git.
 - Compatibilidade com execução local e Streamlit Community Cloud.
-- Dependências fixadas em versões específicas para facilitar a reprodução da entrega.
+- Dependências fixadas em versões específicas para facilitar a reprodução.
 
-## O que a aplicação faz
+## Fluxo de configuração do Gemini
 
-1. O usuário acessa a aplicação com a credencial configurada.
-2. Seleciona uma nota fiscal em PDF.
-3. Clica em **EXTRAIR DADOS**.
-4. O PDF é enviado ao Gemini para leitura e interpretação.
-5. O sistema extrai:
-   - Fornecedor:
-     - Razão social
-     - Nome fantasia
-     - CNPJ
-   - Faturado:
-     - Nome completo
-     - CPF
-   - Número da nota fiscal
-   - Data de emissão
-   - Descrição dos produtos
-   - Quantidade de parcelas
-   - Parcelas e vencimentos
-   - Valor total
-   - Classificação da despesa
-6. O resultado aparece em duas abas:
-   - Visualização formatada
-   - JSON
+A aplicação usa a chave padrão configurada no `.env` ou nos Secrets da
+hospedagem. Quando a aplicação é aberta, ela tenta consultar os modelos dessa
+chave e carregar a lista automaticamente.
+
+Também é possível informar outra API Key na barra lateral:
+
+1. Cole a API Key no campo correspondente.
+2. Pressione **Enter** ou clique fora do campo.
+3. A aplicação consulta `client.models.list()` usando essa chave.
+4. A chave só passa a ser usada se a consulta for aceita.
+5. O seletor de modelos é liberado depois que a lista é carregada.
+6. O usuário escolhe um modelo disponível.
+7. Opcionalmente, pode clicar em **Testar modelo selecionado** antes de enviar o PDF.
+
+A chave temporária é mantida apenas no estado da sessão do Streamlit. Ela não é
+gravada no código-fonte, GitHub, `.env` ou banco de dados.
+
+## Sobre a lista de modelos
+
+O endpoint de modelos informa quais IDs estão visíveis para a chave e quais
+ações cada modelo suporta. A aplicação filtra a resposta para modelos Gemini
+gerais que suportam `generateContent` e remove famílias claramente voltadas a
+imagem, TTS, áudio, live, embeddings e outras modalidades específicas.
+
+A listagem não garante que o modelo esteja respondendo naquele exato momento.
+Por isso existe o botão **Testar modelo selecionado**. Esse teste usa a
+Interactions API e pode consumir uma requisição da cota do modelo.
+
+## Leitura do PDF
+
+A lógica principal de leitura da nota fiscal foi preservada. O PDF continua
+sendo enviado como documento para:
+
+```python
+client.interactions.create(...)
+```
+
+O retorno continua sendo solicitado como JSON estruturado com o schema Pydantic
+de `NotaFiscalExtraida`.
+
+## O que a aplicação extrai
+
+- Fornecedor:
+  - Razão social
+  - Nome fantasia
+  - CNPJ
+- Faturado:
+  - Nome completo
+  - CPF
+- Número da nota fiscal
+- Data de emissão
+- Descrição dos produtos/serviços
+- Quantidade de parcelas
+- Parcelas e vencimentos
+- Valor total
+- Classificação da despesa
+
+O resultado aparece em duas abas:
+
+- Visualização formatada
+- JSON
+
+## Tratamento de erros do Gemini
+
+A aplicação apresenta mensagens específicas para os principais erros:
+
+- **403:** projeto sem permissão para utilizar a API.
+- **404:** modelo não encontrado ou indisponível para a chave/API.
+- **429:** limite de uso ou cota atingida.
+- **503:** modelo temporariamente sobrecarregado.
+
+Os detalhes técnicos continuam disponíveis em uma área expansível.
 
 ## Requisitos
 
@@ -85,12 +140,16 @@ Edite o `.env` e configure:
 
 ```env
 GEMINI_API_KEY=SUA_CHAVE_REAL
-GEMINI_MODEL=gemini-3.8-flash
+GEMINI_MODEL=gemini-3.6-flash
 APP_USERNAME=SEU_USUARIO
 APP_PASSWORD=SUA_SENHA
-APP_VERSION=1.0.0
+APP_VERSION=1.1.0
 GIT_COMMIT=
 ```
+
+`GEMINI_MODEL` funciona como modelo preferencial. Se esse modelo estiver na
+lista retornada para a chave, ele será selecionado inicialmente. Caso não
+esteja, a aplicação escolhe outro modelo disponível.
 
 O `.env` real não deve ser publicado no GitHub.
 
@@ -106,30 +165,26 @@ Normalmente o endereço local será:
 http://localhost:8501
 ```
 
-## Alteração da API Key e do ID do Gemini
+## Chave padrão e chave temporária
 
-Depois do login, abra a barra lateral da aplicação.
+- **Chave do projeto:** vem do `.env` ou dos Secrets do Streamlit.
+- **Chave temporária:** é informada pelo usuário na barra lateral e usada
+  somente durante a sessão.
 
-Na seção **Configuração do Gemini** existem dois campos:
+Quando uma chave temporária estiver ativa, o botão **Chave do projeto** remove
+a chave temporária e recarrega os modelos da chave padrão.
 
-- **API Key do Gemini (opcional):** se ficar vazio, a aplicação usa a chave
-  padrão configurada no `.env` ou nos Secrets do Streamlit. Se o professor
-  informar uma chave, ela passa a ser usada temporariamente somente naquela
-  sessão.
-- **ID do modelo Gemini:** permite trocar o modelo em uso sem editar o código.
+## Seleção de modelo
 
-Após preencher os campos desejados, clique em **Aplicar configuração**.
+O campo de modelo fica bloqueado enquanto nenhuma lista válida de modelos foi
+carregada.
 
-A chave temporária fica apenas no estado da sessão do Streamlit; ela não é
-gravada no código-fonte, no GitHub, no `.env` ou em banco de dados. Ao clicar
-em **Sair**, a chave temporária é removida da sessão.
+Depois da validação da chave, o usuário pode:
 
-Quando uma chave temporária estiver ativa, o botão **Voltar para a chave do
-projeto** restaura imediatamente a chave padrão configurada na hospedagem ou no
-ambiente local.
-
-O modelo padrão continua sendo definido por `GEMINI_MODEL` no `.env` ou nos
-Secrets da hospedagem.
+- selecionar um modelo retornado pela API;
+- recarregar a lista de modelos;
+- testar o modelo selecionado;
+- habilitar a opção avançada e informar manualmente um ID.
 
 ## Login
 
@@ -144,7 +199,7 @@ APP_PASSWORD
 ```
 
 A autenticação é mantida na sessão do Streamlit. O botão **Sair** encerra a
-sessão atual.
+sessão atual e remove a chave temporária e as configurações de modelos.
 
 ## Versionamento Git
 
@@ -162,18 +217,13 @@ git rev-parse --short=8 HEAD
 Se o ambiente de hospedagem não disponibilizar os metadados Git, pode ser
 configurado o fallback `GIT_COMMIT` nos Secrets.
 
-Na entrega final, a recomendação é:
-
-1. finalizar o projeto;
-2. gerar o commit de entrega;
-3. criar uma tag, por exemplo `v1.0.0`;
-4. manter uma branch específica, por exemplo `entrega-final`;
-5. hospedar essa branch no Streamlit Community Cloud.
+Para uma nova entrega da versão 1.1.0, recomenda-se criar um novo commit e uma
+nova tag, preservando a versão 1.0.0 já entregue anteriormente.
 
 ## Streamlit Community Cloud
 
-O projeto já está preparado para receber as mesmas configurações pelo sistema
-de Secrets do Streamlit.
+O projeto está preparado para receber as configurações pelo sistema de Secrets
+do Streamlit.
 
 Existe um exemplo em:
 
@@ -189,7 +239,7 @@ Nunca publique um arquivo `.streamlit/secrets.toml` contendo chaves ou senhas.
 ## Estrutura do projeto
 
 ```text
-projeto_financeiro_streamlit/
+projeto-financeiro-streamlit/
 ├── .streamlit/
 │   └── secrets.toml.example
 ├── app.py
@@ -197,8 +247,7 @@ projeto_financeiro_streamlit/
 ├── .env.example
 ├── .gitignore
 ├── README.md
-├── README_ENTREGA.txt
-└── COMO_EXECUTAR_PROJETO.txt
+└── README_ENTREGA.txt
 ```
 
 ## Segurança
@@ -211,4 +260,4 @@ Não devem ser publicados no GitHub:
 - senhas reais da aplicação;
 - `.venv`;
 - `__pycache__`;
-- `README_ENTREGA.txt` quando ele contiver as credenciais do professor.
+- `README_ENTREGA.txt` quando ele contiver credenciais do professor.
