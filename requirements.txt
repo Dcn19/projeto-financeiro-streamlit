@@ -2,3 +2,4 @@ streamlit==1.64.0
 google-genai==2.25.0
 python-dotenv==1.2.3
 pydantic==2.13.5
+psycopg[binary]>=3.2,<4

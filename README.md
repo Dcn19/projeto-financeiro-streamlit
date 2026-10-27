@@ -1,263 +1,122 @@
-# Projeto Administrativo-Financeiro — Etapa 1
+# Projeto Administrativo-Financeiro · N2 — Etapa 2
 
-Aplicação Web desenvolvida em **Python + Streamlit** para processar uma nota
-fiscal em PDF com o **Gemini** e devolver os dados extraídos em formato
-estruturado e JSON.
+Aplicação em **Python + Streamlit + Gemini + PostgreSQL** que extrai dados de notas fiscais em PDF, consulta cadastros e grava contas a pagar/parcelas. Esta versão preserva o fluxo de extração de PDF e login da Etapa 1.
 
-## Recursos da versão 1.1.0
+## O que foi implementado
 
-- Login único, sem banco de dados.
-- Usuário e senha armazenados fora do código-fonte.
-- Chave padrão do Gemini armazenada fora do código-fonte.
-- Possibilidade de informar uma API Key temporária pela barra lateral.
-- Validação da API Key por meio da consulta de modelos disponíveis.
-- Carregamento automático dos modelos depois que a chave é validada.
-- Seletor de modelo liberado somente depois do carregamento dos modelos.
-- Filtro para modelos Gemini gerais que suportam `generateContent`.
-- Opção avançada para informar um ID manual depois da validação da chave.
-- Teste opcional do modelo selecionado usando a Interactions API.
-- Tratamento amigável para erros comuns como 403, 404, 429 e 503.
-- Leitura do PDF mantida pela **Interactions API**, com saída estruturada em JSON.
-- Identificação da versão da aplicação e do commit Git.
-- Compatibilidade com execução local e Streamlit Community Cloud.
-- Dependências fixadas em versões específicas para facilitar a reprodução.
+- Leitura do PDF pela API Gemini, com resposta JSON estruturada.
+- Conferência e correção manual de fornecedor, faturado, nota fiscal, classes, valores e vencimentos.
+- Consulta ao banco para mostrar `EXISTE — ID`, `NÃO EXISTE` ou `INATIVO — ID`.
+- Cadastro automático e **reativação** de pessoas e classificações quando confirmado.
+- Lançamento de contas a pagar em `movimentocontas` com suas parcelas em `parcelacontas`.
+- Classificações múltiplas por movimento por meio da tabela auxiliar `movimentocontas_classificacao`.
+- Registro **transacional** (se alguma gravação falhar, nenhuma das alterações é confirmada).
+- Bloqueio de nota repetida por CNPJ do fornecedor + número da nota + data de emissão.
+- Identificador exclusivo de parcela, por exemplo `MOV0000000001-P001`.
+- Área de consulta de cadastros ativos/inativos, inativação e reativação (sem exclusão física), além de últimos movimentos.
+- Versão e commit exibidos na tela principal e no rodapé.
 
-## Fluxo de configuração do Gemini
-
-A aplicação usa a chave padrão configurada no `.env` ou nos Secrets da
-hospedagem. Quando a aplicação é aberta, ela tenta consultar os modelos dessa
-chave e carregar a lista automaticamente.
-
-Também é possível informar outra API Key na barra lateral:
-
-1. Cole a API Key no campo correspondente.
-2. Pressione **Enter** ou clique fora do campo.
-3. A aplicação consulta `client.models.list()` usando essa chave.
-4. A chave só passa a ser usada se a consulta for aceita.
-5. O seletor de modelos é liberado depois que a lista é carregada.
-6. O usuário escolhe um modelo disponível.
-7. Opcionalmente, pode clicar em **Testar modelo selecionado** antes de enviar o PDF.
-
-A chave temporária é mantida apenas no estado da sessão do Streamlit. Ela não é
-gravada no código-fonte, GitHub, `.env` ou banco de dados.
-
-## Sobre a lista de modelos
-
-O endpoint de modelos informa quais IDs estão visíveis para a chave e quais
-ações cada modelo suporta. A aplicação filtra a resposta para modelos Gemini
-gerais que suportam `generateContent` e remove famílias claramente voltadas a
-imagem, TTS, áudio, live, embeddings e outras modalidades específicas.
-
-A listagem não garante que o modelo esteja respondendo naquele exato momento.
-Por isso existe o botão **Testar modelo selecionado**. Esse teste usa a
-Interactions API e pode consumir uma requisição da cota do modelo.
-
-## Leitura do PDF
-
-A lógica principal de leitura da nota fiscal foi preservada. O PDF continua
-sendo enviado como documento para:
-
-```python
-client.interactions.create(...)
-```
-
-O retorno continua sendo solicitado como JSON estruturado com o schema Pydantic
-de `NotaFiscalExtraida`.
-
-## O que a aplicação extrai
-
-- Fornecedor:
-  - Razão social
-  - Nome fantasia
-  - CNPJ
-- Faturado:
-  - Nome completo
-  - CPF
-- Número da nota fiscal
-- Data de emissão
-- Descrição dos produtos/serviços
-- Quantidade de parcelas
-- Parcelas e vencimentos
-- Valor total
-- Classificação da despesa
-
-O resultado aparece em duas abas:
-
-- Visualização formatada
-- JSON
-
-## Tratamento de erros do Gemini
-
-A aplicação apresenta mensagens específicas para os principais erros:
-
-- **403:** projeto sem permissão para utilizar a API.
-- **404:** modelo não encontrado ou indisponível para a chave/API.
-- **429:** limite de uso ou cota atingida.
-- **503:** modelo temporariamente sobrecarregado.
-
-Os detalhes técnicos continuam disponíveis em uma área expansível.
-
-## Requisitos
+## Pré-requisitos
 
 - Python 3.11 ou superior
-- Chave da Gemini API
+- Chave ativa da Gemini API
+- Um PostgreSQL acessível de onde o Streamlit estiver hospedado
+- Credenciais de login para o projeto
 
-## 1. Criar o ambiente virtual
+## Configurar o PostgreSQL
 
-No terminal, dentro da pasta do projeto:
+Pode ser utilizado PostgreSQL em Neon, Supabase ou servidor próprio, desde que tenha acesso pela rede do Streamlit. Crie um banco vazio e obtenha a URL de conexão do PostgreSQL. **Não use a URL de uma API REST do provedor**.
+
+Exemplo da estrutura (substitua todos os campos):
+
+```env
+DATABASE_URL=postgresql://usuario:senha@host:5432/nome_do_banco?sslmode=require
+```
+
+> Se a senha contiver símbolos como `@`, `/`, `#` ou `:`, use a URL gerada pelo provedor ou codifique os caracteres especiais no componente da senha.
+
+O programa cria automaticamente, **sem apagar registros existentes**, as tabelas e índices definidos em `sql/001_schema.sql`, na primeira operação com o banco configurado. Opcionalmente você pode executar esse arquivo no editor SQL do provedor para preparar as tabelas antecipadamente.
+
+As tabelas são `pessoas`, `classificacao`, `movimentocontas`, `parcelacontas` e `movimentocontas_classificacao`.
+
+## Rodar localmente no Windows
+
+1. Descompacte este projeto.
+2. Abra o PowerShell na pasta `projeto-financeiro-streamlit`.
+3. Execute:
 
 ```powershell
 python -m venv .venv
-```
-
-Ative o ambiente no PowerShell:
-
-```powershell
 .\.venv\Scripts\Activate.ps1
-```
-
-No Prompt de Comando (CMD):
-
-```cmd
-.venv\Scripts\activate.bat
-```
-
-## 2. Instalar as dependências
-
-```powershell
 python -m pip install -r requirements.txt
-```
-
-## 3. Configurar o ambiente local
-
-Copie `.env.example` para `.env`:
-
-```powershell
 Copy-Item .env.example .env
 ```
 
-Edite o `.env` e configure:
-
-```env
-GEMINI_API_KEY=SUA_CHAVE_REAL
-GEMINI_MODEL=gemini-3.6-flash
-APP_USERNAME=SEU_USUARIO
-APP_PASSWORD=SUA_SENHA
-APP_VERSION=1.1.0
-GIT_COMMIT=
-```
-
-`GEMINI_MODEL` funciona como modelo preferencial. Se esse modelo estiver na
-lista retornada para a chave, ele será selecionado inicialmente. Caso não
-esteja, a aplicação escolhe outro modelo disponível.
-
-O `.env` real não deve ser publicado no GitHub.
-
-## 4. Executar
+4. Abra o arquivo `.env` e preencha `APP_USERNAME`, `APP_PASSWORD`, `GEMINI_API_KEY` e **`DATABASE_URL`**. Ajuste `GEMINI_MODEL` se necessário.
+5. Inicie:
 
 ```powershell
 python -m streamlit run app.py
 ```
 
-Normalmente o endereço local será:
+6. Abra a URL exibida no terminal (normalmente `http://localhost:8501`).
 
-```text
-http://localhost:8501
+**Nunca publique `.env`, uma chave da Gemini ou a URL real do PostgreSQL.**
+
+## Hospedar no Streamlit Community Cloud
+
+1. Envie **o código** para um repositório GitHub e escolha a branch correta na configuração do Streamlit.
+2. Nas configurações do app no Streamlit Community Cloud, abra **Secrets** e configure (somente no painel de Secrets):
+
+```toml
+GEMINI_API_KEY = "sua-chave"
+GEMINI_MODEL = "seu-modelo-funcional"
+APP_USERNAME = "usuario-do-professor"
+APP_PASSWORD = "senha-definida"
+APP_VERSION = "2.0.0"
+DATABASE_URL = "postgresql://usuario:senha@host:5432/banco?sslmode=require"
+GIT_COMMIT = "hash-do-ultimo-commit"
 ```
 
-## Chave padrão e chave temporária
+3. Reinicie/reimplante o aplicativo e abra-o para verificar a conexão com o banco.
+4. **Verifique a branch de deploy:** a entrega antiga utilizava `entrega-final`, e atualizar apenas `main` não atualiza automaticamente um deploy configurado para outra branch.
+5. Faça o commit final e atualize `GIT_COMMIT` no Secrets com o hash **real** desse commit se o ambiente hospedado não disponibilizar o diretório `.git`. O programa tenta ler o commit real de `.git` primeiro.
 
-- **Chave do projeto:** vem do `.env` ou dos Secrets do Streamlit.
-- **Chave temporária:** é informada pelo usuário na barra lateral e usada
-  somente durante a sessão.
+## Teste do fluxo completo
 
-Quando uma chave temporária estiver ativa, o botão **Chave do projeto** remove
-a chave temporária e recarrega os modelos da chave padrão.
+1. Entre com login e senha.
+2. Escolha/valide um modelo da Gemini e envie um PDF de nota fiscal.
+3. Verifique os dados extraídos na tela; eles continuarão visíveis após as interações.
+4. Na seção **Etapa 2**, revise os documentos, a data e a soma das parcelas.
+5. Clique **1 · Consultar cadastros**: o sistema mostra o que já existe e o que será criado/reativado.
+6. Clique **2 · Confirmar lançamento**: confirme o ID do movimento salvo.
+7. Abra **Cadastros e movimentos registrados** e pesquise os registros.
+8. Consulte novamente a mesma nota: ela deve ser detectada como **já lançada**, sem criar duplicidade.
+9. Teste a alteração de status de pessoa/classificação e sua reativação.
 
-## Seleção de modelo
+### Regras e cuidados
 
-O campo de modelo fica bloqueado enquanto nenhuma lista válida de modelos foi
-carregada.
+- O sistema exige CNPJ com 14 dígitos para o fornecedor, CPF/CNPJ para faturado, número/data de emissão, classificação, valor positivo e parcelas com vencimento.
+- As parcelas precisam somar **exatamente** o total informado antes do lançamento.
+- Não são inventadas datas de vencimento quando a nota não as informa; complete manualmente.
+- Os documentos são conferidos pela **quantidade de dígitos**; esta versão não faz validação matemática de dígitos verificadores CPF/CNPJ.
+- `inativar` altera o status, não remove registros. Cadastro inativo encontrado no lançamento é reativado após a confirmação.
+- Não foi criada rotina automática de conciliação bancária ou contas a receber: a Etapa 2 do PDF descreve o fluxo de `APAGAR`.
 
-Depois da validação da chave, o usuário pode:
+## Verificações automatizadas
 
-- selecionar um modelo retornado pela API;
-- recarregar a lista de modelos;
-- testar o modelo selecionado;
-- habilitar a opção avançada e informar manualmente um ID.
-
-## Login
-
-O projeto utiliza somente uma credencial. Não existe banco de dados de
-usuários.
-
-As variáveis utilizadas são:
-
-```text
-APP_USERNAME
-APP_PASSWORD
+```powershell
+python -m unittest discover -s tests -v
+python -m compileall -q .
 ```
 
-A autenticação é mantida na sessão do Streamlit. O botão **Sair** encerra a
-sessão atual e remove a chave temporária e as configurações de modelos.
+Os testes automatizados cobrem validação dos dados **sem exigir banco/serviço Gemini**. O teste integrado de leitura de PDF e gravação real exige as credenciais e um banco PostgreSQL acessível.
 
-## Versionamento Git
+## Entrega no Classroom
 
-O rodapé e a barra lateral mostram:
+O professor pediu um arquivo `Readme.txt` contendo a URL hospedada, login, senha, chave LLM e o código do último commit do GitHub, que precisa aparecer na tela principal. Copie `Readme.MODELO.txt` para `Readme.txt`, preencha os dados reais e entregue o arquivo **privadamente no Classroom**. O nome `Readme.txt` está no `.gitignore` para não ser enviado ao GitHub sem querer. Se possível, utilize uma API Key exclusiva, com cota limitada, e revogue-a após a avaliação.
 
-- versão da aplicação (`APP_VERSION`);
-- commit Git da execução.
+## Integrantes
 
-A aplicação tenta executar automaticamente:
-
-```text
-git rev-parse --short=8 HEAD
-```
-
-Se o ambiente de hospedagem não disponibilizar os metadados Git, pode ser
-configurado o fallback `GIT_COMMIT` nos Secrets.
-
-Para uma nova entrega da versão 1.1.0, recomenda-se criar um novo commit e uma
-nova tag, preservando a versão 1.0.0 já entregue anteriormente.
-
-## Streamlit Community Cloud
-
-O projeto está preparado para receber as configurações pelo sistema de Secrets
-do Streamlit.
-
-Existe um exemplo em:
-
-```text
-.streamlit/secrets.toml.example
-```
-
-No painel do Streamlit Community Cloud, copie as configurações para a área de
-Secrets e substitua os valores de exemplo pelos valores reais.
-
-Nunca publique um arquivo `.streamlit/secrets.toml` contendo chaves ou senhas.
-
-## Estrutura do projeto
-
-```text
-projeto-financeiro-streamlit/
-├── .streamlit/
-│   └── secrets.toml.example
-├── app.py
-├── requirements.txt
-├── .env.example
-├── .gitignore
-├── README.md
-└── README_ENTREGA.txt
-```
-
-## Segurança
-
-Não devem ser publicados no GitHub:
-
-- `.env`;
-- `.streamlit/secrets.toml`;
-- chaves reais da Gemini API;
-- senhas reais da aplicação;
-- `.venv`;
-- `__pycache__`;
-- `README_ENTREGA.txt` quando ele contiver credenciais do professor.
+- Danilo Couto Naves
+- Fabiano Borges da Cunha Sobrinho

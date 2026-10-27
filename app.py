@@ -7,12 +7,18 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, get_args
 
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 from pydantic import BaseModel, Field
+
+from financeiro import ErroLancamento, validar_lancamento
+from banco import (
+    inicializar_banco, consultar_cadastros, registrar_lancamento,
+    listar_cadastros, atualizar_status_cadastro, listar_movimentos,
+)
 
 
 # ============================================================
@@ -23,7 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 st.set_page_config(
-    page_title="Extração de Dados de Nota Fiscal",
+    page_title="Projeto Administrativo-Financeiro · N2 Etapa 2",
     page_icon="📄",
     layout="centered",
 )
@@ -56,7 +62,8 @@ GEMINI_MODEL_PADRAO = obter_configuracao(
 
 APP_USERNAME = obter_configuracao("APP_USERNAME")
 APP_PASSWORD = obter_configuracao("APP_PASSWORD")
-APP_VERSION = obter_configuracao("APP_VERSION", "1.1.0")
+APP_VERSION = obter_configuracao("APP_VERSION", "2.0.0")
+DATABASE_URL = obter_configuracao("DATABASE_URL")
 GIT_COMMIT_CONFIGURADO = obter_configuracao("GIT_COMMIT")
 
 
@@ -177,7 +184,7 @@ def mostrar_tela_login() -> None:
         """
 <div style="text-align:center;">
     <span class="project-badge">
-        Projeto Administrativo-Financeiro · Etapa 1
+        Projeto Administrativo-Financeiro · Etapa 2
     </span>
 </div>
 
@@ -355,6 +362,11 @@ class Fornecedor(BaseModel):
 
 
 class Faturado(BaseModel):
+    cnpj: Optional[str] = Field(
+        default=None,
+        description="CNPJ do faturado quando o destinatário for pessoa jurídica.",
+    )
+
     nome_completo: Optional[str] = Field(
         default=None,
         description="Nome completo do faturado/destinatário da nota fiscal.",
@@ -518,7 +530,8 @@ REGRAS OBRIGATÓRIAS:
 4. O FATURADO é o destinatário da nota fiscal.
    Extraia:
    - nome completo;
-   - CPF.
+   - CPF (quando pessoa física);
+   - CNPJ (quando pessoa jurídica).
 
 5. Extraia o número da nota fiscal e a data de emissão.
 
@@ -1173,6 +1186,265 @@ def mostrar_resultado(resultado: NotaFiscalExtraida) -> None:
         )
 
 
+
+# ============================================================
+# ETAPA 2: CONSULTA AO BANCO E LANÇAMENTO FINANCEIRO
+# ============================================================
+
+
+@st.cache_resource(show_spinner=False)
+def preparar_banco(url: str) -> bool:
+    """Cria tabelas ausentes sem alterar cadastros existentes."""
+    inicializar_banco(url)
+    return True
+
+
+def etiqueta_cadastro(registro: Optional[dict]) -> str:
+    if registro is None:
+        return "🔴 NÃO EXISTE — será cadastrado"
+    if registro["status"] == "INATIVO":
+        return f"🟠 INATIVO — ID {registro['id']} (será reativado)"
+    return f"🟢 EXISTE — ID {registro['id']}"
+
+
+def preparar_parcelas_editor(resultado: NotaFiscalExtraida) -> list[dict]:
+    if resultado.parcelas:
+        return [
+            {
+                "Número": parcela.numero or i,
+                "Vencimento (DD/MM/AAAA)": parcela.data_vencimento or "",
+                "Valor (R$)": float(parcela.valor or 0),
+            }
+            for i, parcela in enumerate(resultado.parcelas, 1)
+        ]
+    # Sem vencimentos confiáveis, não inventamos datas: o usuário os preenche.
+    return [{
+        "Número": 1,
+        "Vencimento (DD/MM/AAAA)": "",
+        "Valor (R$)": float(resultado.valor_total or 0),
+    }]
+
+
+def mostrar_lancamento_financeiro(resultado: NotaFiscalExtraida, hash_pdf: str) -> None:
+    st.divider()
+    st.header("Etapa 2 · Lançamento de contas a pagar")
+    st.caption(
+        "Confira os dados do Gemini, complemente informações ausentes e consulte "
+        "o banco antes de registrar. Nenhum lançamento é feito sem confirmação."
+    )
+
+    if not DATABASE_URL:
+        st.warning(
+            "Banco PostgreSQL ainda não configurado. Adicione DATABASE_URL no .env "
+            "ou nos Secrets da hospedagem para consultar e registrar os dados."
+        )
+        return
+
+    try:
+        preparar_banco(DATABASE_URL)
+    except Exception:
+        st.error("Não foi possível conectar ou preparar o banco PostgreSQL.")
+        st.caption("Confira o endereço DATABASE_URL, o SSL e as permissões do banco.")
+        return
+
+    if st.session_state.get("pdf_conferido_hash") != hash_pdf:
+        st.session_state.pop("previa_lancamento", None)
+        st.session_state.pop("lancamento_finalizado", None)
+        st.session_state["pdf_conferido_hash"] = hash_pdf
+
+    with st.form(f"form_contas_{hash_pdf[:12]}"):
+        st.markdown("#### Dados do fornecedor")
+        col1, col2 = st.columns(2)
+        with col1:
+            nome_fornecedor = st.text_input(
+                "Razão social do fornecedor",
+                value=resultado.fornecedor.razao_social or "",
+            )
+            fantasia_fornecedor = st.text_input(
+                "Nome fantasia (opcional)",
+                value=resultado.fornecedor.nome_fantasia or "",
+            )
+        with col2:
+            cnpj_fornecedor = st.text_input(
+                "CNPJ do fornecedor",
+                value=resultado.fornecedor.cnpj or "",
+            )
+
+        st.markdown("#### Dados do faturado")
+        c1, c2 = st.columns(2)
+        with c1:
+            nome_faturado = st.text_input(
+                "Nome do faturado",
+                value=resultado.faturado.nome_completo or "",
+            )
+        with c2:
+            documento_faturado = st.text_input(
+                "CPF ou CNPJ do faturado",
+                value=resultado.faturado.cpf or resultado.faturado.cnpj or "",
+            )
+
+        st.markdown("#### Movimento")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            nota = st.text_input("Número da nota fiscal", value=resultado.numero_nota_fiscal or "")
+        with c2:
+            emissao = st.text_input("Data de emissão (DD/MM/AAAA)", value=resultado.data_emissao or "")
+        with c3:
+            total = st.number_input(
+                "Valor total (R$)", min_value=0.0, value=float(resultado.valor_total or 0.0),
+                step=0.01, format="%.2f",
+            )
+        descricao = st.text_area(
+            "Descrição resumida (opcional)",
+            value="; ".join(resultado.descricao_produtos), height=85,
+        )
+        categorias = st.multiselect(
+            "Classificação(ões) de despesa",
+            options=list(get_args(CategoriaDespesa)),
+            default=list(resultado.classificacao_despesa),
+        )
+        st.markdown("#### Parcelas")
+        st.caption("É possível corrigir valores/vencimentos e adicionar parcelas na tabela.")
+        linhas = st.data_editor(
+            preparar_parcelas_editor(resultado),
+            key=f"parcelas_editor_{hash_pdf[:12]}",
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Número": st.column_config.NumberColumn("Número", min_value=1, step=1),
+                "Vencimento (DD/MM/AAAA)": st.column_config.TextColumn("Vencimento (DD/MM/AAAA)"),
+                "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", min_value=0, step=0.01, format="R$ %.2f"),
+            },
+        )
+        consultar = st.form_submit_button("1 · CONSULTAR CADASTROS", type="primary", use_container_width=True)
+
+    if consultar:
+        try:
+            if hasattr(linhas, "to_dict"):
+                linhas = linhas.to_dict(orient="records")
+            parcelas = [
+                {
+                    "numero": linha.get("Número"),
+                    "vencimento": linha.get("Vencimento (DD/MM/AAAA)"),
+                    "valor": linha.get("Valor (R$)"),
+                }
+                for linha in linhas
+            ]
+            entrada = {
+                "fornecedor_nome": nome_fornecedor,
+                "fornecedor_fantasia": fantasia_fornecedor,
+                "fornecedor_documento": cnpj_fornecedor,
+                "faturado_nome": nome_faturado,
+                "faturado_documento": documento_faturado,
+                "numero_nota": nota,
+                "data_emissao": emissao,
+                "descricao": descricao,
+                "valor_total": total,
+                "classificacoes": categorias,
+                "parcelas": parcelas,
+            }
+            validar_lancamento(entrada)
+            pesquisa = consultar_cadastros(DATABASE_URL, entrada)
+            st.session_state["previa_lancamento"] = {
+                "entrada": entrada,
+                "pesquisa": pesquisa,
+                "pdf": hash_pdf,
+            }
+            st.session_state.pop("lancamento_finalizado", None)
+        except ErroLancamento as erro:
+            st.session_state.pop("previa_lancamento", None)
+            st.error(str(erro))
+        except Exception:
+            st.session_state.pop("previa_lancamento", None)
+            st.error("A consulta ao banco não foi concluída. Confira a conexão.")
+
+    previa = st.session_state.get("previa_lancamento")
+    if not previa or previa.get("pdf") != hash_pdf:
+        return
+    consulta = previa["pesquisa"]
+    if st.session_state.get("lancamento_finalizado"):
+        finalizado = st.session_state["lancamento_finalizado"]
+        st.success(
+            f"Lançamento realizado com sucesso! Movimento ID {finalizado['movimento_id']} "
+            f"e {finalizado['parcelas']} parcela(s) registrada(s)."
+        )
+        st.info(
+            "Os cadastros ausentes foram criados e os inativos, reativados. "
+            "Consulte os movimentos abaixo para conferir o registro."
+        )
+        return
+    st.markdown("#### Resultado da consulta")
+    st.write("**FORNECEDOR:**", etiqueta_cadastro(consulta["fornecedor"]))
+    st.write("**FATURADO:**", etiqueta_cadastro(consulta["faturado"]))
+    for classificacao in consulta["classificacoes"]:
+        st.write(f"**DESPESA — {classificacao['descricao']}:**", etiqueta_cadastro(classificacao["registro"]))
+
+    if consulta["movimento_existente"]:
+        st.error(
+            "Esta nota fiscal já foi lançada como movimento "
+            f"ID {consulta['movimento_existente']['id']}. Para evitar duplicidade, "
+            "o sistema bloqueou o novo lançamento."
+        )
+        return
+
+    st.info("Ao confirmar, novos cadastros serão criados e os inativos serão reativados.")
+    if st.button("2 · CONFIRMAR LANÇAMENTO", type="primary", use_container_width=True):
+        try:
+            resultado_gravacao = registrar_lancamento(DATABASE_URL, previa["entrada"])
+            st.session_state["lancamento_finalizado"] = resultado_gravacao
+            st.rerun()
+        except ErroLancamento as erro:
+            st.error(str(erro))
+        except Exception:
+            st.error("Não foi possível gravar. A transação foi cancelada, sem salvar dados parciais.")
+
+
+def mostrar_consultas_administrativas() -> None:
+    if not DATABASE_URL:
+        return
+    with st.expander("Cadastros e movimentos registrados", expanded=False):
+        try:
+            preparar_banco(DATABASE_URL)
+            tipo = st.radio(
+                "Consultar", ["Pessoas", "Classificações", "Últimos movimentos"], horizontal=True,
+            )
+            if tipo == "Últimos movimentos":
+                if st.button("Carregar lançamentos", use_container_width=True):
+                    movimentos = listar_movimentos(DATABASE_URL)
+                    if movimentos:
+                        st.dataframe(movimentos, hide_index=True, use_container_width=True)
+                    else:
+                        st.info("Nenhum movimento cadastrado.")
+            else:
+                entidade = "pessoas" if tipo == "Pessoas" else "classificacao"
+                termo = st.text_input("Buscar por ID, nome, documento ou descrição", value="")
+                inativos = st.checkbox("Incluir inativos")
+                if st.button("Buscar cadastros", use_container_width=True):
+                    st.session_state["cadastros_encontrados"] = listar_cadastros(
+                        DATABASE_URL, entidade, termo, inativos,
+                    )
+                    st.session_state["cadastros_entidade"] = entidade
+                if st.session_state.get("cadastros_entidade") == entidade:
+                    registros = st.session_state.get("cadastros_encontrados", [])
+                    if registros:
+                        st.dataframe(registros, hide_index=True, use_container_width=True)
+                        opcoes = {f"{r['id']} - {r['descricao']} ({r['status']})": r for r in registros}
+                        selecionado = st.selectbox("Cadastro para inativar / reativar", list(opcoes))
+                        escolhido = opcoes[selecionado]
+                        novo_status = "INATIVO" if escolhido["status"] == "ATIVO" else "ATIVO"
+                        if st.button(f"Alterar status para {novo_status}", use_container_width=True):
+                            atualizar_status_cadastro(DATABASE_URL, entidade, escolhido["id"], novo_status)
+                            st.session_state.pop("cadastros_encontrados", None)
+                            st.success("Status atualizado. Execute uma nova busca para conferir.")
+                    else:
+                        st.info("Nenhum cadastro encontrado. Use Buscar para consultar o banco.")
+        except ErroLancamento as erro:
+            st.error(str(erro))
+        except Exception:
+            st.error("Não foi possível realizar a consulta administrativa ao banco.")
+
+
 def mostrar_identificacao_alunos(
     modelo_gemini: str,
 ) -> None:
@@ -1556,7 +1828,7 @@ st.markdown(
     """
 <div style="text-align:center;">
     <span class="project-badge">
-        Projeto Administrativo-Financeiro · Etapa 1
+        Projeto Administrativo-Financeiro · Etapa 2
     </span>
 </div>
 
@@ -1571,6 +1843,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+st.caption(f"Versão {APP_VERSION} · Último commit do GitHub: {obter_commit_git()}")
 
 configuracao_gemini_pronta = bool(
     obter_chave_gemini_ativa()
@@ -1632,44 +1906,46 @@ st.markdown(
 
 st.write("")
 
+if arquivo is None:
+    st.session_state.pop("nota_extraida", None)
+    st.session_state.pop("hash_pdf_extraido", None)
+    st.session_state.pop("previa_lancamento", None)
+    st.session_state.pop("lancamento_finalizado", None)
+else:
+    hash_pdf_atual = hashlib.sha256(arquivo.getvalue()).hexdigest()
+    if st.session_state.get("hash_pdf_extraido") != hash_pdf_atual:
+        st.session_state.pop("nota_extraida", None)
+        st.session_state.pop("previa_lancamento", None)
+        st.session_state.pop("lancamento_finalizado", None)
+
 if botao_extrair and arquivo is not None:
     try:
-        with st.spinner(
-            "Analisando a nota fiscal com o Gemini..."
-        ):
+        with st.spinner("Analisando a nota fiscal com o Gemini..."):
             resultado = extrair_nota_fiscal(
                 arquivo.getvalue(),
                 st.session_state["gemini_model"],
                 obter_chave_gemini_ativa(),
             )
-
-        st.success(
-            "Dados extraídos com sucesso."
-        )
-
-        with st.container(border=True):
-            mostrar_resultado(
-                resultado
-            )
-
+        st.session_state["nota_extraida"] = resultado.model_dump(mode="json")
+        st.session_state["hash_pdf_extraido"] = hash_pdf_atual
+        st.session_state.pop("previa_lancamento", None)
+        st.session_state.pop("lancamento_finalizado", None)
+        st.success("Dados extraídos com sucesso.")
     except ValueError as erro:
-        st.error(
-            str(erro)
-        )
-
+        st.error(str(erro))
     except Exception as erro:
-        titulo, mensagem = mensagem_amigavel_erro_gemini(
-            erro,
-            contexto="extracao",
-        )
+        titulo, mensagem = mensagem_amigavel_erro_gemini(erro, contexto="extracao")
         st.error(f"{titulo}. {mensagem}")
+        with st.expander("Detalhes técnicos do erro"):
+            st.code(str(erro))
 
-        with st.expander(
-            "Detalhes técnicos do erro"
-        ):
-            st.code(
-                str(erro)
-            )
+if st.session_state.get("nota_extraida") and arquivo is not None:
+    resultado_persistido = NotaFiscalExtraida.model_validate(st.session_state["nota_extraida"])
+    with st.container(border=True):
+        mostrar_resultado(resultado_persistido)
+    mostrar_lancamento_financeiro(resultado_persistido, hash_pdf_atual)
+
+mostrar_consultas_administrativas()
 
 
 # ============================================================

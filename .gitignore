@@ -21,3 +21,10 @@ __pycache__/
 # Sistema operacional
 .DS_Store
 Thumbs.db
+
+# Entrega privada ao professor (inclui credenciais e API Key)
+Readme.txt
+
+# Arquivos locais de testes
+.pytest_cache/
+*.sqlite3
